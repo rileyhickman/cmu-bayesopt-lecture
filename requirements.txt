@@ -4,3 +4,4 @@ gpytorch
 botorch
 matplotlib
 seaborn
+silence-tensorflow
