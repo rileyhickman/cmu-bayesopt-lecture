@@ -32,6 +32,9 @@ from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import GammaPrior
 
+from botorch.models import MultiTaskGP
+
+
 from utils import (
 	cat_param_to_feat,
 	propose_randomly,
@@ -69,18 +72,20 @@ class CategoricalSingleTaskGP(ExactGP, GPyTorchModel):
 		return MultivariateNormal(mean_x, covar_x)
 
 
-
-
-class BoTorchPlanner(CustomPlanner):
-	''' Wrapper for GP-based Bayesiam optimization with BoTorch
+class MultiTaskBO(CustomPlanner):
+	''' Wrapper for mutitask Bayesian optimization using a multitask
+	GP as the surrogate model.
 
 	Args:
-		goal (str): the optimization goal, "maximize" or "minimize"
+		goal (str): the optimization goal, "maximize", or "minimize"
 		batch_size (int): number of samples to measure per batch (will be fixed at 1 for now)
 		random_seed (int): the random seed to use
-		num_initial_design (int): number of points to sample using the initial
-			design strategy
+		num_init_design (int):  number of points to sample using the initial design strategy
 		init_design_strategy (str): the inital design strategy, "random" or "sobol"
+		tasks (list): list of dictionaries containing the tasks, dictionaties have
+			strucure {'params': [...], 'values': [...]} where the values are 2d numpy
+			arrays
+
 	'''
 
 	def __init__(
@@ -90,6 +95,7 @@ class BoTorchPlanner(CustomPlanner):
 		random_seed=None,
 		num_init_design=5,
 		init_design_strategy='random',
+		tasks=None,
 		**kwargs,
 	):
 		AbstractPlanner.__init__(**locals())
@@ -102,6 +108,14 @@ class BoTorchPlanner(CustomPlanner):
 		np.random.seed(self.random_seed)
 		self.num_init_design = num_init_design
 		self.init_design_strategy = init_design_strategy
+		self.tasks = tasks
+
+		#>>>>>>>>
+		# add the task id to the list of task dictionaries as
+		# the task features
+		for idx, task in enumerate(self.tasks):
+			task['task_idx'] = idx+1.
+		#<<<<<<<<
 
 
 	def _set_param_space(self, param_space):
@@ -116,7 +130,6 @@ class BoTorchPlanner(CustomPlanner):
 			self.has_descriptors = False
 		else:
 			self.has_descriptors = True
-
 
 	def build_train_data(self):
 		''' build the training dataset at each iteration
@@ -136,6 +149,24 @@ class BoTorchPlanner(CustomPlanner):
 			target_values.append(targ_value)
 		train_x = np.array(target_params)  # (# target obs, # param dim)
 		train_y = np.array(target_values)  # (# target obs, 1)
+
+		#>>>>>>>>
+		target_task = {'params': train_x, 'values': train_y, 'task_idx': 0.0}
+		all_tasks = self.tasks+[target_task]
+
+		# concatenate together all of the tasks params and task idx
+
+		train_x = []
+		for task in all_tasks:
+			idx = np.repeat(task['task_idx'], task['params'].shape[0]).reshape(-1, 1)
+			params_w_idx = np.concatenate((task['params'], idx), axis=1)
+			train_x.append(params_w_idx)
+		train_x = np.concatenate(train_x)
+
+		# concatenate together all of the tasks values (no task features needed)
+		train_y = np.concatenate([task['values'] for task in all_tasks])
+
+		#<<<<<<<<
 
 		self._means_y = np.array([np.mean(train_y[:, ix]) for ix in range(train_y.shape[1])])
 		# guard against the case where we have std = 0.0
@@ -165,8 +196,7 @@ class BoTorchPlanner(CustomPlanner):
 
 
 	def _ask(self):
-		''' query the planner for a batch of new parameter points to measure
-		'''
+
 		# infer the problem type
 		problem_type = infer_problem_type(self.param_space)
 
@@ -187,15 +217,15 @@ class BoTorchPlanner(CustomPlanner):
 				# TODO: implement a method to retrieve the categorical dimensions
 				model = MixedSingleTaskGP(self.train_x_scaled, self.train_y_scaled, cat_dims=None)
 			elif problem_type == 'fully_categorical':
-				# if we have no descriptors, use a Categorical kernel
-				# based on the HammingDistance
-				if self.has_descriptors:
-					# we have some descriptors, use the Matern kernel
-					model = SingleTaskGP(self.train_x_scaled, self.train_y_scaled)
-				else:
-					# if we have no descriptors, use a Categorical kernel
-					# based on the HammingDistance
-					model = CategoricalSingleTaskGP(self.train_x_scaled, self.train_y_scaled)
+
+				#>>>>>>>>
+				model = MultiTaskGP(
+					self.train_x_scaled,
+					self.train_y_scaled,
+					task_feature=-1,  # the index of the task feature (last inedx here)
+					output_tasks=[0], # a list of task indices to compute the output
+				)
+				#<<<<<<<<
 
 
 			# fit the GP
@@ -203,9 +233,11 @@ class BoTorchPlanner(CustomPlanner):
 			fit_gpytorch_model(mll)
 
 			# get the incumbent point
-			f_best_argmin = torch.argmin(self.train_y_scaled)
+			#>>>>>>>>
+			f_best_argmin = torch.argmin(self.train_y_scaled[-self._values.shape[0]:])
 			f_best_scaled = self.train_y_scaled[f_best_argmin][0].float()
-			f_best_raw    = self._values[f_best_argmin][0]
+			#>>>>>>>>
+			#f_best_raw    = self._values[f_best_argmin][0]
 
 			acqf = ExpectedImprovement(model, f_best_scaled, objective=None, maximize=False) # always minimization in Olympus
 
@@ -257,14 +289,11 @@ class BoTorchPlanner(CustomPlanner):
 
 
 
-
-#==============
+#============
 # DEBUGGING
-#==============
+#============
 
 if __name__ == '__main__':
-
-	PARAM_TYPE = 'perovskites'
 
 	from olympus.objects import (
 		ParameterContinuous,
@@ -274,93 +303,10 @@ if __name__ == '__main__':
 	from olympus.campaigns import Campaign, ParameterSpace
 	from olympus.surfaces import Surface
 
-
-
-	def surface(x):
-		return np.sin(8*x)
+	PARAM_TYPE = 'perovskites_descriptors'
 
 	if PARAM_TYPE == 'continuous':
-		param_space = ParameterSpace()
-		param_0 = ParameterContinuous(name='param_0', low=0.0, high=1.0)
-		param_space.add(param_0)
-
-		planner = BoTorchPlanner(goal='minimize')
-		planner.set_param_space(param_space)
-
-		campaign = Campaign()
-		campaign.set_param_space(param_space)
-
-		BUDGET = 24
-
-
-		for num_iter in range(BUDGET):
-
-			samples = planner.recommend(campaign.observations)
-			print(f'ITER : {num_iter}\tSAMPLES : {samples}')
-			for sample in samples:
-				sample_arr = sample.to_array()
-				measurement = surface(
-					sample_arr.reshape((1, sample_arr.shape[0]))
-				)
-				campaign.add_observation(sample_arr, measurement[0])
-
-
-
-	elif PARAM_TYPE == 'categorical':
-
-		surface_kind = 'CatDejong'
-		surface = Surface(kind=surface_kind, param_dim=2, num_opts=21)
-
-		campaign = Campaign()
-		campaign.set_param_space(surface.param_space)
-
-		planner = BoTorchPlanner(goal='minimize')
-		planner.set_param_space(surface.param_space)
-
-		OPT = ['x10', 'x10']
-
-		BUDGET = 442
-
-		for iter in range(BUDGET):
-
-			samples = planner.recommend(campaign.observations)
-			print(f'ITER : {iter}\tSAMPLES : {samples}')
-			sample = samples[0]
-			sample_arr = sample.to_array()
-			measurement = np.array(surface.run(sample_arr))
-			campaign.add_observation(sample_arr, measurement[0])
-
-			if [sample_arr[0], sample_arr[1]] == OPT:
-				print(f'FOUND OPTIMUM AFTER {iter+1} ITERATIONS!')
-				break
-
-
-	elif PARAM_TYPE == 'suzuki':
-
-		from olympus.emulators import Emulator
-		from olympus.datasets import Dataset
-
-		# load the Olympus emulator
-		emul = Emulator(dataset='suzuki', model='BayesNeuralNet')
-
-		dataset = Dataset(kind='suzuki')
-
-		planner = BoTorchPlanner(goal='maximize')
-		planner.set_param_space(dataset.param_space)
-
-		campaign = Campaign()
-		campaign.set_param_space(dataset.param_space)
-
-		BUDGET = 24
-
-		for iter in range(BUDGET):
-
-			samples = planner.recommend(campaign.observations)
-			sample_arr = samples[0].to_array()
-			measurement = emul.run(sample_arr)
-			print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement[0][0]}')
-			campaign.add_observation(sample_arr, measurement[0][0])
-
+		pass
 
 	elif PARAM_TYPE == 'perovskites':
 		# load in the perovskites dataset
@@ -378,6 +324,28 @@ if __name__ == '__main__':
 			assert len(match)==1
 			bandgap = match.loc[:, 'hse06'].to_numpy()[0]
 			return bandgap
+
+		#>>>>>>>>
+		def sample_tasks(num_points, param_space, random_state=None):
+			'''  sample some GGA level bandgap measurements
+			'''
+			samples = lookup_df.sample(
+				n=num_points, replace=False, random_state=random_state,
+			)
+			param_str = samples[['organic', 'anion', 'cation']].values
+			params = []
+			for sample_ix, targ_param in enumerate(param_str):
+				sample_x = []
+				for param_ix, (space_true, element) in enumerate(zip(param_space, targ_param)):
+					feat = cat_param_to_feat(space_true, element)
+					sample_x.extend(feat)
+
+				params.append(sample_x)
+			params = torch.tensor(np.array(params))
+			values = torch.tensor(samples['gga'].values.reshape(-1, 1))
+
+			return [{'params': params, 'values': values}]
+		#<<<<<<<<
 
 		# build the experiment
 		organic_options = lookup_df.organic.unique().tolist()
@@ -408,8 +376,14 @@ if __name__ == '__main__':
 		)
 		param_space.add(cation_param)
 
-		planner = BoTorchPlanner(goal='minimize')
+		#>>>>>>>>
+		# sample some low-fidelity points
+		gga_tasks = sample_tasks(num_points=50, param_space=param_space, random_state=100700)
+		planner = MultiTaskBO(
+			goal='minimize', tasks=gga_tasks
+		)
 		planner.set_param_space(param_space)
+		#<<<<<<<<
 
 		campaign = Campaign()
 		campaign.set_param_space(param_space)
@@ -431,7 +405,6 @@ if __name__ == '__main__':
 
 
 	elif PARAM_TYPE == 'perovskites_descriptors':
-
 		# load in the perovskites dataset
 		lookup_df = pickle.load(open('datasets_emulators/perovskites/perovskites.pkl', 'rb'))
 
@@ -448,10 +421,32 @@ if __name__ == '__main__':
 			bandgap = match.loc[:, 'hse06'].to_numpy()[0]
 			return bandgap
 
+		#>>>>>>>>
+		def sample_tasks(num_points, param_space, random_state=None):
+			'''  sample some GGA level bandgap measurements
+			'''
+			samples = lookup_df.sample(
+				n=num_points, replace=False, random_state=random_state,
+			)
+			param_str = samples[['organic', 'anion', 'cation']].values
+			params = []
+			for sample_ix, targ_param in enumerate(param_str):
+				sample_x = []
+				for param_ix, (space_true, element) in enumerate(zip(param_space, targ_param)):
+					feat = cat_param_to_feat(space_true, element)
+					sample_x.extend(feat)
+				params.append(sample_x)
+			params = torch.tensor(np.array(params))
+			values = torch.tensor(samples['gga'].values.reshape(-1, 1))
+
+			return [{'params': params, 'values': values}]
+		#<<<<<<<<
+
 		def get_descriptors(element, kind):
 			''' retrive the descriptors for a given element
 			'''
 			return lookup_df.loc[(lookup_df[kind]==element)].loc[:, lookup_df.columns.str.startswith(f'{kind}-')].values[0].tolist()
+
 
 		# build the experiment
 		organic_options = lookup_df.organic.unique().tolist()
@@ -482,8 +477,14 @@ if __name__ == '__main__':
 		)
 		param_space.add(cation_param)
 
-		planner = BoTorchPlanner(goal='minimize')
+		#>>>>>>>>
+		# sample some low-fidelity points
+		gga_tasks = sample_tasks(num_points=192, param_space=param_space, random_state=100700)
+		planner = MultiTaskBO(
+			goal='minimize', tasks=gga_tasks
+		)
 		planner.set_param_space(param_space)
+		#<<<<<<<<
 
 		campaign = Campaign()
 		campaign.set_param_space(param_space)
