@@ -18,8 +18,6 @@ from botorch.fit import fit_gpytorch_model
 from botorch.optim import optimize_acqf, optimize_acqf_mixed, optimize_acqf_discrete
 from botorch.acquisition import ExpectedImprovement
 
-from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
-
 from olympus.planners import CustomPlanner, AbstractPlanner
 from olympus import ParameterVector
 
@@ -30,7 +28,6 @@ from gpytorch.models import ExactGP
 from gpytorch.kernels import RBFKernel, ScaleKernel, MaternKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from gpytorch.priors import GammaPrior
 
 from botorch.models import MultiTaskGP
 

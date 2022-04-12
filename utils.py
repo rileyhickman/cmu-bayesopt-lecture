@@ -116,15 +116,26 @@ def propose_randomly(num_proposals, param_space):
 
 
 
-def forward_transform(data, means, stds):
+def forward_standardize(data, means, stds):
 	''' forward standardize the data
 	'''
 	return (data - means) / stds
 
-def reverse_transform(data, means, stds):
+def reverse_standardize(data, means, stds):
 	''' un-standardize the data
 	'''
 	return (data*stds) + means
+
+def forward_normalize(data, min, max):
+	''' forward normalize the data
+	'''
+	return (data - min) / (max - min)
+
+def reverse_normalize(data, min, max):
+	''' un-normlaize the data
+	'''
+	return data * (max - min) + min
+
 
 def project_to_olymp(results_np, param_space, has_descriptors=False, choices_feat=None, choices_cat=None):
 	''' project an acquisition function result numpy array to an
@@ -194,4 +205,4 @@ def get_bounds(param_space, has_descriptors):
 			else:
 				bounds += [[0, 1] for _ in param.options]
 
-	return torch.tensor(bounds).T.float()
+	return torch.tensor(np.array(bounds)).T.float()

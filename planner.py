@@ -18,8 +18,6 @@ from botorch.fit import fit_gpytorch_model
 from botorch.optim import optimize_acqf, optimize_acqf_mixed, optimize_acqf_discrete
 from botorch.acquisition import ExpectedImprovement
 
-from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
-
 from olympus.planners import CustomPlanner, AbstractPlanner
 from olympus import ParameterVector
 
@@ -30,13 +28,14 @@ from gpytorch.models import ExactGP
 from gpytorch.kernels import RBFKernel, ScaleKernel, MaternKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from gpytorch.priors import GammaPrior
 
 from utils import (
 	cat_param_to_feat,
 	propose_randomly,
-	forward_transform,
-	reverse_transform,
+	forward_normalize,
+	reverse_normalize,
+	forward_standardize,
+	reverse_standardize,
 	infer_problem_type,
 	project_to_olymp,
 	create_available_options,
@@ -107,15 +106,21 @@ class BoTorchPlanner(CustomPlanner):
 	def _set_param_space(self, param_space):
 		''' set the Olympus parameter space (not actually really needed)
 		'''
+		# infer the problem type
+		self.problem_type = infer_problem_type(self.param_space)
+
 		# make attribute that indicates wether or not we are using descriptors for
 		# categorical variables
-		descriptors = []
-		for p in self.param_space:
-			descriptors.extend(p.descriptors)
-		if all(d is None for d in descriptors):
-			self.has_descriptors = False
+		if self.problem_type == 'fully_categorical':
+			descriptors = []
+			for p in self.param_space:
+				descriptors.extend(p.descriptors)
+			if all(d is None for d in descriptors):
+				self.has_descriptors = False
+			else:
+				self.has_descriptors = True
 		else:
-			self.has_descriptors = True
+			self.has_descriptors = False
 
 
 	def build_train_data(self):
@@ -137,13 +142,20 @@ class BoTorchPlanner(CustomPlanner):
 		train_x = np.array(target_params)  # (# target obs, # param dim)
 		train_y = np.array(target_values)  # (# target obs, 1)
 
+		self._mins_x = np.array([np.amin(train_x[:, ix]) for ix in range(train_x.shape[1])])
+		self._maxs_x = np.array([np.amax(train_x[:, ix]) for ix in range(train_x.shape[1])])
+
 		self._means_y = np.array([np.mean(train_y[:, ix]) for ix in range(train_y.shape[1])])
 		# guard against the case where we have std = 0.0
 		self._stds_y = np.array([np.std(train_y[:, ix]) for ix in range(train_y.shape[1])])
 		self._stds_y = np.where(self._stds_y==0.0, 1., self._stds_y)
 
-		# forward transform (standardization)
-		train_y = forward_transform(train_y, self._means_y, self._stds_y)
+		if not self.problem_type=='fully_categorical' and not self.has_descriptors:
+			# forward transform on features (min max)
+			train_x = forward_normalize(train_x, self._mins_x, self._maxs_x)
+		# forward transform on targets (standardization)
+		train_y = forward_standardize(train_y, self._means_y, self._stds_y)
+
 
 		# convert to torch tensors and return
 		return torch.tensor(train_x).double(), torch.tensor(train_y).double()
@@ -167,8 +179,6 @@ class BoTorchPlanner(CustomPlanner):
 	def _ask(self):
 		''' query the planner for a batch of new parameter points to measure
 		'''
-		# infer the problem type
-		problem_type = infer_problem_type(self.param_space)
 
 		if len(self._values) < self.num_init_design:
 			# sample using initial design strategy
@@ -181,12 +191,12 @@ class BoTorchPlanner(CustomPlanner):
 			self.train_x_scaled, self.train_y_scaled = self.build_train_data()
 
 			# infer the model based on the parameter types
-			if problem_type == 'fully_continuous':
+			if self.problem_type == 'fully_continuous':
 				model = SingleTaskGP(self.train_x_scaled, self.train_y_scaled)
-			elif problem_type == 'mixed':
+			elif self.problem_type == 'mixed':
 				# TODO: implement a method to retrieve the categorical dimensions
 				model = MixedSingleTaskGP(self.train_x_scaled, self.train_y_scaled, cat_dims=None)
-			elif problem_type == 'fully_categorical':
+			elif self.problem_type == 'fully_categorical':
 				# if we have no descriptors, use a Categorical kernel
 				# based on the HammingDistance
 				if self.has_descriptors:
@@ -212,7 +222,7 @@ class BoTorchPlanner(CustomPlanner):
 			bounds = get_bounds(self.param_space, self.has_descriptors)
 			choices_feat, choices_cat = None, None
 
-			if problem_type == 'fully_continuous':
+			if self.problem_type == 'fully_continuous':
 				results, _ = optimize_acqf(
 					acq_function=acqf,
 					bounds=bounds,
@@ -220,7 +230,7 @@ class BoTorchPlanner(CustomPlanner):
 					q=self.batch_size,
 					raw_samples=1000
 				)
-			elif problem_type == 'mixed':
+			elif self.problem_type == 'mixed':
 				results, _ = optimize_acqf_mixed(
 					acq_function=acqf,
 					bounds=bounds,
@@ -228,12 +238,16 @@ class BoTorchPlanner(CustomPlanner):
 					q=self.batch_size,
 					raw_samples=1000
 				)
-			elif problem_type == 'fully_categorical':
+			elif self.problem_type == 'fully_categorical':
 				# need to implement the choices input, which is a
 				# (num_choices * d) torch.Tensor of the possible choices
 				# need to generate fully cartesian product space of possible
 				# choices
 				choices_feat, choices_cat = create_available_options(self.param_space, self._params)
+
+				if self.has_descriptors:
+					choices_feat = forward_normalize(choices_feat.detach().numpy(), self._mins_x, self._maxs_x)
+					choices_feat = torch.tensor(choices_feat)
 
 				results, _ = optimize_acqf_discrete(
 					acq_function=acqf,
@@ -245,6 +259,14 @@ class BoTorchPlanner(CustomPlanner):
 
 			# convert the results form torch tensor to numpy
 			results_np = np.squeeze(results.detach().numpy())
+
+			if not self.problem_type=='fully_categorical' and not self.has_descriptors:
+				# reverse transform the inputs
+				results_np = reverse_normalize(results_np, self._mins_x, self._maxs_x)
+
+			if choices_feat is not None:
+				choices_feat = reverse_normalize(choices_feat, self._mins_x, self._maxs_x)
+
 			# project the sample back to Olympus format
 			sample = project_to_olymp(
 				results_np, self.param_space,
@@ -252,6 +274,7 @@ class BoTorchPlanner(CustomPlanner):
 				choices_feat=choices_feat, choices_cat=choices_cat,
 			)
 			return_params = [ParameterVector().from_dict(sample, self.param_space)]
+
 
 		return return_params
 
@@ -265,6 +288,8 @@ class BoTorchPlanner(CustomPlanner):
 if __name__ == '__main__':
 
 	PARAM_TYPE = 'perovskites'
+
+	NUM_RUNS = 40
 
 	from olympus.objects import (
 		ParameterContinuous,
@@ -305,7 +330,6 @@ if __name__ == '__main__':
 				campaign.add_observation(sample_arr, measurement[0])
 
 
-
 	elif PARAM_TYPE == 'categorical':
 
 		surface_kind = 'CatDejong'
@@ -339,27 +363,73 @@ if __name__ == '__main__':
 
 		from olympus.emulators import Emulator
 		from olympus.datasets import Dataset
+		from olympus.planners import Planner
+		from olympus import Database
+
+		all_campaigns = []
 
 		# load the Olympus emulator
 		emul = Emulator(dataset='suzuki', model='BayesNeuralNet')
 
 		dataset = Dataset(kind='suzuki')
 
-		planner = BoTorchPlanner(goal='maximize')
-		planner.set_param_space(dataset.param_space)
+		for i in range(NUM_RUNS):
+			planner = BoTorchPlanner(goal='maximize')
+			planner.set_param_space(dataset.param_space)
 
-		campaign = Campaign()
-		campaign.set_param_space(dataset.param_space)
+			campaign = Campaign()
+			campaign.set_param_space(dataset.param_space)
 
-		BUDGET = 24
+			BUDGET = 25
 
-		for iter in range(BUDGET):
+			for iter in range(BUDGET):
 
-			samples = planner.recommend(campaign.observations)
-			sample_arr = samples[0].to_array()
-			measurement = emul.run(sample_arr)
-			print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement[0][0]}')
-			campaign.add_observation(sample_arr, measurement[0][0])
+				samples = planner.recommend(campaign.observations)
+				sample_arr = samples[0].to_array()
+				measurement = emul.run(sample_arr)
+				print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement[0][0]}')
+				campaign.add_observation(sample_arr, measurement[0][0])
+
+			all_campaigns.append(campaign)
+
+		pickle.dump(all_campaigns, open('results/suzuki_botorch.pkl', 'wb'))
+
+
+	elif PARAM_TYPE == 'suzuki_random':
+
+		from olympus.emulators import Emulator
+		from olympus.datasets import Dataset
+		from olympus.planners import Planner
+		from olympus import Database
+
+		all_campaigns = []
+
+		# load the Olympus emulator
+		emul = Emulator(dataset='suzuki', model='BayesNeuralNet')
+
+		dataset = Dataset(kind='suzuki')
+
+		for i in range(NUM_RUNS):
+
+			planner = Planner(kind='RandomSearch')
+			planner.set_param_space(dataset.param_space)
+
+			campaign = Campaign()
+			campaign.set_param_space(dataset.param_space)
+
+			BUDGET = 25
+
+			for iter in range(BUDGET):
+
+				samples = planner.recommend(campaign.observations)
+				sample_arr = samples[0].to_array()
+				measurement = emul.run(sample_arr)
+				print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement[0][0]}')
+				campaign.add_observation(sample_arr, measurement[0][0])
+
+			all_campaigns.append(campaign)
+
+		pickle.dump(all_campaigns, open('results/suzuki_random.pkl', 'wb'))
 
 
 	elif PARAM_TYPE == 'perovskites':
@@ -379,55 +449,140 @@ if __name__ == '__main__':
 			bandgap = match.loc[:, 'hse06'].to_numpy()[0]
 			return bandgap
 
-		# build the experiment
-		organic_options = lookup_df.organic.unique().tolist()
-		anion_options = lookup_df.anion.unique().tolist()
-		cation_options = lookup_df.cation.unique().tolist()
+		all_campaigns = []
 
-		# make the parameter space
-		param_space = ParameterSpace()
+		for i in range(NUM_RUNS):
 
-		organic_param = ParameterCategorical(
-			name='organic',
-			options=organic_options,
-			descriptors=[None for _ in organic_options],
-		)
-		param_space.add(organic_param)
+			# build the experiment
+			organic_options = lookup_df.organic.unique().tolist()
+			anion_options = lookup_df.anion.unique().tolist()
+			cation_options = lookup_df.cation.unique().tolist()
 
-		anion_param = ParameterCategorical(
-			name='anion',
-			options=anion_options,
-			descriptors=[None for _ in anion_options],
-		)
-		param_space.add(anion_param)
+			# make the parameter space
+			param_space = ParameterSpace()
 
-		cation_param = ParameterCategorical(
-			name='cation',
-			options=cation_options,
-			descriptors=[None for _ in cation_options],
-		)
-		param_space.add(cation_param)
+			organic_param = ParameterCategorical(
+				name='organic',
+				options=organic_options,
+				descriptors=[None for _ in organic_options],
+			)
+			param_space.add(organic_param)
 
-		planner = BoTorchPlanner(goal='minimize')
-		planner.set_param_space(param_space)
+			anion_param = ParameterCategorical(
+				name='anion',
+				options=anion_options,
+				descriptors=[None for _ in anion_options],
+			)
+			param_space.add(anion_param)
 
-		campaign = Campaign()
-		campaign.set_param_space(param_space)
+			cation_param = ParameterCategorical(
+				name='cation',
+				options=cation_options,
+				descriptors=[None for _ in cation_options],
+			)
+			param_space.add(cation_param)
 
-		BUDGET = 192
+			planner = BoTorchPlanner(goal='minimize')
+			planner.set_param_space(param_space)
 
-		OPT = ['hydrazinium', 'I', 'Sn'] # value = 1.5249 eV
+			campaign = Campaign()
+			campaign.set_param_space(param_space)
 
-		for iter in range(BUDGET):
-			samples = planner.recommend(campaign.observations)
-			measurement = measure(samples[0])
-			print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement}')
-			campaign.add_observation(samples[0], measurement)
+			BUDGET = 192
 
-			# check for convergence
-			if [samples[0]['organic'], samples[0]['anion'], samples[0]['cation']] == OPT:
-				print(f'FOUND OPTIMUM AFTER {iter+1} ITERATIONS!')
-				break
+			OPT = ['hydrazinium', 'I', 'Sn'] # value = 1.5249 eV
+
+			for iter in range(BUDGET):
+				samples = planner.recommend(campaign.observations)
+				measurement = measure(samples[0])
+				print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement}')
+				campaign.add_observation(samples[0], measurement)
+
+				# check for convergence
+				if [samples[0]['organic'], samples[0]['anion'], samples[0]['cation']] == OPT:
+					print(f'FOUND OPTIMUM AFTER {iter+1} ITERATIONS!')
+					break
+			all_campaigns.append(campaign)
+
+		pickle.dump(all_campaigns, open('results/perovskites_botorch_naive.pkl', 'wb'))
+
+
+	elif PARAM_TYPE == 'perovskites_random':
+		# load in the perovskites dataset
+		lookup_df = pickle.load(open('datasets_emulators/perovskites/perovskites.pkl', 'rb'))
+
+		from olympus.planners import Planner
+
+		# make a function for measuring the perovskite bandgap
+		def measure(param):
+			''' lookup the HSEO6 bandgap for given perovskite component
+			'''
+			match = lookup_df.loc[
+							(lookup_df.organic == param['organic']) &
+							(lookup_df.anion == param['anion']) &
+							(lookup_df.cation == param['cation'])
+						]
+			assert len(match)==1
+			bandgap = match.loc[:, 'hse06'].to_numpy()[0]
+			return bandgap
+
+		all_campaigns = []
+
+		for i in range(NUM_RUNS):
+
+			# build the experiment
+			organic_options = lookup_df.organic.unique().tolist()
+			anion_options = lookup_df.anion.unique().tolist()
+			cation_options = lookup_df.cation.unique().tolist()
+
+			# make the parameter space
+			param_space = ParameterSpace()
+
+			organic_param = ParameterCategorical(
+				name='organic',
+				options=organic_options,
+				descriptors=[None for _ in organic_options],
+			)
+			param_space.add(organic_param)
+
+			anion_param = ParameterCategorical(
+				name='anion',
+				options=anion_options,
+				descriptors=[None for _ in anion_options],
+			)
+			param_space.add(anion_param)
+
+			cation_param = ParameterCategorical(
+				name='cation',
+				options=cation_options,
+				descriptors=[None for _ in cation_options],
+			)
+			param_space.add(cation_param)
+
+
+			planner = Planner(kind='RandomSearch')
+			planner.set_param_space(param_space)
+
+			campaign = Campaign()
+			campaign.set_param_space(param_space)
+
+			BUDGET = 192
+
+			OPT = ['hydrazinium', 'I', 'Sn'] # value = 1.5249 eV
+
+			for iter in range(BUDGET):
+				samples = planner.recommend(campaign.observations)
+				measurement = measure(samples[0])
+				print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement}')
+				campaign.add_observation(samples[0], measurement)
+
+				# check for convergence
+				if [samples[0]['organic'], samples[0]['anion'], samples[0]['cation']] == OPT:
+					print(f'FOUND OPTIMUM AFTER {iter+1} ITERATIONS!')
+					break
+			all_campaigns.append(campaign)
+
+		pickle.dump(all_campaigns, open('results/perovskites_random.pkl', 'wb'))
 
 
 	elif PARAM_TYPE == 'perovskites_descriptors':
@@ -453,52 +608,57 @@ if __name__ == '__main__':
 			'''
 			return lookup_df.loc[(lookup_df[kind]==element)].loc[:, lookup_df.columns.str.startswith(f'{kind}-')].values[0].tolist()
 
-		# build the experiment
-		organic_options = lookup_df.organic.unique().tolist()
-		anion_options = lookup_df.anion.unique().tolist()
-		cation_options = lookup_df.cation.unique().tolist()
+		all_campaigns = []
+		for i in range(NUM_RUNS):
+			# build the experiment
+			organic_options = lookup_df.organic.unique().tolist()
+			anion_options = lookup_df.anion.unique().tolist()
+			cation_options = lookup_df.cation.unique().tolist()
 
-		# make the parameter space
-		param_space = ParameterSpace()
+			# make the parameter space
+			param_space = ParameterSpace()
 
-		organic_param = ParameterCategorical(
-			name='organic',
-			options=organic_options,
-			descriptors=[get_descriptors(option, 'organic') for option in organic_options],
-		)
-		param_space.add(organic_param)
+			organic_param = ParameterCategorical(
+				name='organic',
+				options=organic_options,
+				descriptors=[get_descriptors(option, 'organic') for option in organic_options],
+			)
+			param_space.add(organic_param)
 
-		anion_param = ParameterCategorical(
-			name='anion',
-			options=anion_options,
-			descriptors=[get_descriptors(option, 'anion') for option in anion_options],
-		)
-		param_space.add(anion_param)
+			anion_param = ParameterCategorical(
+				name='anion',
+				options=anion_options,
+				descriptors=[get_descriptors(option, 'anion') for option in anion_options],
+			)
+			param_space.add(anion_param)
 
-		cation_param = ParameterCategorical(
-			name='cation',
-			options=cation_options,
-			descriptors=[get_descriptors(option, 'cation') for option in cation_options],
-		)
-		param_space.add(cation_param)
+			cation_param = ParameterCategorical(
+				name='cation',
+				options=cation_options,
+				descriptors=[get_descriptors(option, 'cation') for option in cation_options],
+			)
+			param_space.add(cation_param)
 
-		planner = BoTorchPlanner(goal='minimize')
-		planner.set_param_space(param_space)
+			planner = BoTorchPlanner(goal='minimize', num_init_design=10)
+			planner.set_param_space(param_space)
 
-		campaign = Campaign()
-		campaign.set_param_space(param_space)
+			campaign = Campaign()
+			campaign.set_param_space(param_space)
 
-		BUDGET = 192
+			BUDGET = 192
 
-		OPT = ['hydrazinium', 'I', 'Sn'] # value = 1.5249 eV
+			OPT = ['hydrazinium', 'I', 'Sn'] # value = 1.5249 eV
 
-		for iter in range(BUDGET):
-			samples = planner.recommend(campaign.observations)
-			measurement = measure(samples[0])
-			print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement}')
-			campaign.add_observation(samples[0], measurement)
+			for iter in range(BUDGET):
+				samples = planner.recommend(campaign.observations)
+				measurement = measure(samples[0])
+				print(f'ITER : {iter}\tSAMPLES : {samples}\t MEASUREMENT : {measurement}')
+				campaign.add_observation(samples[0], measurement)
 
-			# check for convergence
-			if [samples[0]['organic'], samples[0]['anion'], samples[0]['cation']] == OPT:
-				print(f'FOUND OPTIMUM AFTER {iter+1} ITERATIONS!')
-				break
+				# check for convergence
+				if [samples[0]['organic'], samples[0]['anion'], samples[0]['cation']] == OPT:
+					print(f'FOUND OPTIMUM AFTER {iter+1} ITERATIONS!')
+					break
+			all_campaigns.append(campaign)
+
+		pickle.dump(all_campaigns, open('results/perovskites_botorch_descriptors.pkl', 'wb'))
